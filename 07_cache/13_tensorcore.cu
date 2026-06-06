@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <cublas_v2.h>
 #include <mma.h>
+#include <cuda_fp16.h> // <- AJOUT SÉCURITÉ pour half et __float2half
 #include <chrono>
 #include <cmath>
 
@@ -24,7 +25,7 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
     int warp_m = warp_id / 4; 
     int warp_n = warp_id % 4; 
 
-    // DOUBLE BUFFERING : Ajout d'une dimension [2] pour les deux étages du pipeline
+    // Double buffering pour le pipelining
     __shared__ half block_a[2][16][TILE_SIZE + 8];
     __shared__ half block_b[2][16][TILE_SIZE + 8];
 
@@ -40,10 +41,9 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
 
     int write_stage = 0;
 
-    // La boucle fait une itération de plus (dim_k + 16) pour vider le pipeline à la fin
     for (int k = 0; k < dim_k + 16; k += 16) {
         
-        // 1. CHARGEMENT ASYNCHRONE / ANTICIPÉ (Étage d'écriture)
+        // 1. CHARGEMENT ANTICIPÉ
         if (k < dim_k) {
             #pragma unroll
             for (int step = 0; step < 2; ++step) {
@@ -92,10 +92,9 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
             }
         }
 
-        // Une seule synchro pour valider le chargement de l'un et la lecture de l'autre
         __syncthreads();
 
-        // 2. CALCUL DES TENSOR CORES (Étage de lecture, itération k - 16)
+        // 2. CALCULS TENSOR CORES
         if (k > 0) {
             int read_stage = 1 - write_stage;
             #pragma unroll
@@ -115,11 +114,10 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
             }
         }
         
-        // Alternance des buffers
         write_stage = 1 - write_stage;
     }
 
-    // --- ÉCRITURE FINALE ---
+    // ÉCRITURE
     #pragma unroll
     for (int r = 0; r < 4; r++) {
         #pragma unroll
@@ -134,12 +132,8 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
 }
 
 int main(int argc, const char **argv) {
-    int m = 10240;
-    int k = 4096;
-    int n = 8192;
-    float alpha = 1.0;
-    float beta = 0.0;
-    int Nt = 10;
+    int m = 10240; int k = 4096; int n = 8192;
+    float alpha = 1.0; float beta = 0.0; int Nt = 10;
     
     float *A, *B, *C, *C2;
     cudaMallocManaged(&A, m * k * sizeof(float));
@@ -148,15 +142,9 @@ int main(int argc, const char **argv) {
     cudaMallocManaged(&C2, m * n * sizeof(float));
     
     srand48(42); 
-    for (int i=0; i<m; i++)
-        for (int j=0; j<k; j++)
-            A[k*i+j] = drand48();
-    for (int i=0; i<k; i++)
-        for (int j=0; j<n; j++)
-            B[n*i+j] = drand48();
-    for (int i=0; i<n; i++)
-        for (int j=0; j<m; j++)
-            C[m*i+j] = C2[m*i+j] = 0;
+    for (int i=0; i<m; i++) for (int j=0; j<k; j++) A[k*i+j] = drand48();
+    for (int i=0; i<k; i++) for (int j=0; j<n; j++) B[n*i+j] = drand48();
+    for (int i=0; i<n; i++) for (int j=0; j<m; j++) C[m*i+j] = C2[m*i+j] = 0;
 
     cublasHandle_t cublas_handle;
     cublasCreate(&cublas_handle);
@@ -184,20 +172,14 @@ int main(int argc, const char **argv) {
     double tcustom = chrono::duration<double>(toc - tic).count() / Nt;
     double custom_flops = double(num_flops) / tcustom / 1.0e9;
 
-    double eff_percentage = (custom_flops / cublas_flops) * 100.0;
-
     printf("===================================================\n");
     printf("CUBLAS       : %.2f Gflops\n", cublas_flops);
     printf("CUSTOM KERNEL: %.2f Gflops\n", custom_flops);
-    printf("PERFORMANCE  : %.2f%% de cuBLAS\n", eff_percentage);
+    printf("PERFORMANCE  : %.2f%% de cuBLAS\n", (custom_flops / cublas_flops) * 100.0);
     printf("===================================================\n");
 
     double err = 0;
-    for (int i=0; i<n; i++) {
-        for (int j=0; j<m; j++) {
-            err += fabs(C[m*i+j] - C2[m*i+j]);
-        }
-    }
+    for (int i=0; i<n; i++) for (int j=0; j<m; j++) err += fabs(C[m*i+j] - C2[m*i+j]);
     printf("error: %lf\n", err/n/m);
 
     cudaFree(A); cudaFree(B); cudaFree(C); cudaFree(C2);
