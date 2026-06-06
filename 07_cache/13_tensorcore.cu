@@ -1,13 +1,3 @@
-/*
- * Optimized Tensor Core GEMM for H100
- * Key optimizations vs 13_tensorcore.cu:
- *   - 128x128 output tile per block (vs 64x64)
- *   - 4 warps per block arranged in 2x2 warp grid
- *   - Double buffering in shared memory to hide load latency
- *   - Each warp computes a 32x64 sub-tile (2x4 WMMA fragments)
- *   - Prefetch global→registers before __syncthreads
- */
-
 #include <iostream>
 #include <random>
 #include <stdint.h>
@@ -23,7 +13,7 @@ using namespace nvcuda;
 #define WARPS_M 2
 #define WARPS_N 2
 #define NUM_WARPS (WARPS_M * WARPS_N)
-#define BLOCK_THREADS (NUM_WARPS * 32)  // 128 threads
+#define BLOCK_THREADS (NUM_WARPS * 32)
 #define WARP_TILE_M (TILE_M / WARPS_M)  // 64
 #define WARP_TILE_N (TILE_N / WARPS_N)  // 64
 #define FRAG_M (WARP_TILE_M / 16)       // 4
@@ -57,17 +47,19 @@ __global__ void kernel_opt(int dim_m, int dim_n, int dim_k,
     // Preload first K-tile into buffer 0
     {
         int k_base = 0;
+        // A is col-major: d_a[k_row * dim_m + m_col]
         for (int idx = threadIdx.x; idx < TILE_K * TILE_M; idx += BLOCK_THREADS) {
             int tk = idx / TILE_M, tm = idx % TILE_M;
             int g_k = k_base + tk, g_m = block_m + tm;
             smem_a[0][tk][tm] = (g_k < dim_k && g_m < dim_m)
                                  ? __float2half(d_a[g_k * dim_m + g_m]) : __float2half(0.f);
         }
+        // B is col-major on N: d_b[n_col * dim_k + k_row]
         for (int idx = threadIdx.x; idx < TILE_K * TILE_N; idx += BLOCK_THREADS) {
             int tk = idx / TILE_N, tn = idx % TILE_N;
             int g_k = k_base + tk, g_n = block_n + tn;
             smem_b[0][tk][tn] = (g_k < dim_k && g_n < dim_n)
-                                 ? __float2half(d_b[g_k * dim_n + g_n]) : __float2half(0.f);
+                                 ? __float2half(d_b[g_n * dim_k + g_k]) : __float2half(0.f);
         }
     }
     __syncthreads();
@@ -76,7 +68,7 @@ __global__ void kernel_opt(int dim_m, int dim_n, int dim_k,
         int cur_buf  = kt & 1;
         int next_buf = 1 - cur_buf;
 
-        // Prefetch next tile while computing current
+        // Prefetch next tile
         if (kt + 1 < num_k_tiles) {
             int k_base = (kt + 1) * TILE_K;
             for (int idx = threadIdx.x; idx < TILE_K * TILE_M; idx += BLOCK_THREADS) {
@@ -89,7 +81,7 @@ __global__ void kernel_opt(int dim_m, int dim_n, int dim_k,
                 int tk = idx / TILE_N, tn = idx % TILE_N;
                 int g_k = k_base + tk, g_n = block_n + tn;
                 smem_b[next_buf][tk][tn] = (g_k < dim_k && g_n < dim_n)
-                                           ? __float2half(d_b[g_k * dim_n + g_n]) : __float2half(0.f);
+                                           ? __float2half(d_b[g_n * dim_k + g_k]) : __float2half(0.f);
             }
         }
 
