@@ -12,7 +12,7 @@ using namespace nvcuda;
 
 const int TILE_SIZE = 64;
 
-__global__ void kernel_optimized_v6(int dim_m, int dim_n, int dim_k,
+__global__ void kernel_optimized_v7(int dim_m, int dim_n, int dim_k,
                                     const float * __restrict__ d_a, 
                                     const float * __restrict__ d_b, 
                                     float *d_c) {
@@ -21,9 +21,9 @@ __global__ void kernel_optimized_v6(int dim_m, int dim_n, int dim_k,
     int offset_b_n = TILE_SIZE * blockIdx.y;
     int warp_id = threadIdx.x / 32;
 
-    // Mémoire partagée alignée
-    __shared__ half block_a[16][TILE_SIZE];
-    __shared__ half block_b[16][TILE_SIZE];
+    // Mémoire partagée alignée avec PADDING (+8) pour supprimer les conflits de bancs
+    __shared__ half block_a[16][TILE_SIZE + 8];
+    __shared__ half block_b[16][TILE_SIZE + 8];
 
     // Accumulateurs de fragments WMMA
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
@@ -39,7 +39,7 @@ __global__ void kernel_optimized_v6(int dim_m, int dim_n, int dim_k,
     // Boucle principale le long de la dimension K
     for (int k = 0; k < dim_k; k += 16) {
         
-        // --- CHARGEMENT VECTORISÉ 128-BIT (FLOAT4) DE LA MATRICE A ---
+        // --- CHARGEMENT VECTORISÉ 128-BIT DE LA MATRICE A (COALESCÉ) ---
         #pragma unroll
         for (int step = 0; step < 4; ++step) {
             int row_k = step * 4 + (threadIdx.x / 16); 
@@ -50,7 +50,6 @@ __global__ void kernel_optimized_v6(int dim_m, int dim_n, int dim_k,
             int global_k = k + row_k;
             
             if (global_m < dim_m && global_k < dim_k) {
-                // Lecture coalescée de 16 octets d'un coup
                 float4 tmp = reinterpret_cast<const float4*>(&d_a[global_k * dim_m + global_m])[0];
                 block_a[row_k][col_m + 0] = __float2half(tmp.x);
                 block_a[row_k][col_m + 1] = __float2half(tmp.y);
@@ -64,19 +63,19 @@ __global__ void kernel_optimized_v6(int dim_m, int dim_n, int dim_k,
             }
         }
 
-        // --- CHARGEMENT VECTORISÉ 128-BIT (FLOAT4) DE LA MATRICE B ---
+        // --- CHARGEMENT VECTORISÉ 128-BIT DE LA MATRICE B (PARFAITEMENT COALESCÉ PAR PACKS DE 4 THREADS) ---
         #pragma unroll
         for (int step = 0; step < 4; ++step) {
-            int global_f4_idx = threadIdx.x + step * 64;
-            int col_n = global_f4_idx / 4; 
-            int row_k_quad = global_f4_idx % 4; 
-            int row_k = row_k_quad * 4; 
+            int col_offset = threadIdx.x / 4; 
+            int row_quad = threadIdx.x % 4;   
+            
+            int col_n = step * 16 + col_offset; 
+            int row_k = row_quad * 4;           
             
             int global_n = offset_b_n + col_n;
             int global_k = k + row_k;
             
             if (global_n < dim_n && global_k < dim_k) {
-                // Alignement parfait respectant l'axe contigu de B
                 float4 tmp = reinterpret_cast<const float4*>(&d_b[global_n * dim_k + global_k])[0];
                 block_b[row_k + 0][col_n] = __float2half(tmp.x);
                 block_b[row_k + 1][col_n] = __float2half(tmp.y);
@@ -90,7 +89,7 @@ __global__ void kernel_optimized_v6(int dim_m, int dim_n, int dim_k,
             }
         }
 
-        // Synchronisation des warps après le chargement des tuiles
+        // Synchronisation matérielle
         __syncthreads();
 
         // --- CALCULS WMMA INTENSIFS ---
@@ -98,12 +97,12 @@ __global__ void kernel_optimized_v6(int dim_m, int dim_n, int dim_k,
         for (int r = 0; r < 2; r++) {
             int row_tile = warp_id * 2 + r;
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-            wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], TILE_SIZE);
+            wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], TILE_SIZE + 8);
 
             #pragma unroll
             for (int c = 0; c < 4; c++) {
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], TILE_SIZE);
+                wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], TILE_SIZE + 8);
                 
                 wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
             }
@@ -177,10 +176,10 @@ int main(int argc, const char **argv) {
     dim3 block = dim3(TILE_SIZE);
     dim3 grid = dim3((m + TILE_SIZE - 1) / TILE_SIZE, (n + TILE_SIZE - 1) / TILE_SIZE);
 
-    // Benchmark Kernel Vectorisé
+    // Benchmark Kernel Vectorisé V7
     for (int i = 0; i < Nt+2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        kernel_optimized_v6<<< grid, block >>>(m, n, k, A, B, C2);
+        kernel_optimized_v7<<< grid, block >>>(m, n, k, A, B, C2);
         cudaDeviceSynchronize();
     }
     toc = chrono::steady_clock::now();
