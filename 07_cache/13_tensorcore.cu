@@ -12,19 +12,14 @@ using namespace std;
 #define TILE_N 128
 #define TILE_K 64
 #define PAD 8
-#define BLOCK_THREADS 128  // 1 warpgroup = 4 warps
+#define BLOCK_THREADS 128
 
-// Correct smem descriptor for wgmma per PTX ISA 8.x
 __device__ __forceinline__ uint64_t make_smem_desc(half* ptr, int ld_bytes) {
     uint64_t desc = 0;
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-    // bits [13:0]: start address >> 4
     desc |= ((uint64_t)(addr >> 4) & 0x3FFF) << 0;
-    // bits [29:16]: leading dimension (stride between rows) in units of 16 bytes
     desc |= ((uint64_t)(ld_bytes >> 4) & 0x3FFF) << 16;
-    // bits [45:32]: stride dimension = same as leading dim for row-major
     desc |= ((uint64_t)(ld_bytes >> 4) & 0x3FFF) << 32;
-    // bits [61:60]: base offset = 0, layout = 0 (row major)
     return desc;
 }
 
@@ -38,14 +33,11 @@ kernel_wgmma(int dim_m, int dim_n, int dim_k,
     int block_n = blockIdx.y * TILE_N;
     int tid = threadIdx.x;
 
-    // Shared memory: double buffered
     __shared__ __align__(128) half smem_a[2][TILE_K][TILE_M + PAD];
     __shared__ __align__(128) half smem_b[2][TILE_K][TILE_N + PAD];
 
     int num_k_tiles = (dim_k + TILE_K - 1) / TILE_K;
 
-    // Accumulators: wgmma m64n64k16 f32 → 32 floats per warpgroup per call
-    // We do 2x2 wgmma calls (TILE_M/WGMMA_M x TILE_N/WGMMA_N)
     float acc[2][2][32];
     #pragma unroll
     for (int i = 0; i < 2; i++)
@@ -55,7 +47,6 @@ kernel_wgmma(int dim_m, int dim_n, int dim_k,
             for (int k = 0; k < 32; k++)
                 acc[i][j][k] = 0.f;
 
-    // Load tile lambda
     auto load_tile = [&](int buf, int k_base) {
         for (int idx = tid; idx < TILE_K * TILE_M; idx += BLOCK_THREADS) {
             int tk = idx / TILE_M, tm = idx % TILE_M;
@@ -81,12 +72,10 @@ kernel_wgmma(int dim_m, int dim_n, int dim_k,
         if (kt + 1 < num_k_tiles)
             load_tile(next, (kt + 1) * TILE_K);
 
-        // wgmma fence before issuing new MMAs
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 
         #pragma unroll
         for (int ki = 0; ki < TILE_K / WGMMA_K; ki++) {
-            // 4 wgmma calls: 2 along M x 2 along N
             #pragma unroll
             for (int mi = 0; mi < 2; mi++) {
                 #pragma unroll
@@ -135,11 +124,15 @@ kernel_wgmma(int dim_m, int dim_n, int dim_k,
         __syncthreads();
     }
 
-    // Store: wgmma m64n64k16 f32 register layout
-    // 128 threads, each owns 32 floats → 4096 output elements per wgmma tile
-    // Layout: thread t → rows {t/4, t/4+8, t/4+16, t/4+24, ...}, cols {(t%4)*2, (t%4)*2+1, +8, +9, ...}
+    // Store: wgmma m64n64k16 f32 register layout per PTX ISA
+    // 128 threads, 32 regs each → 4096 floats per 64x64 tile
+    // thread tid owns:
+    //   row = (lane/4) + (warp/2)*16 + (reg_group)*8  (reg_group in 0..3)
+    //   col = (lane%4)*2 + (col_group)*16             (col_group in 0..3, pairs with reg_group)
+    // Each group of 4 consecutive regs: [row, col], [row, col+1], [row+8, col], [row+8, col+1]
     int lane = tid % 32;
     int warp = tid / 32;
+    int row_base = (lane / 4) + (warp / 2) * 16;
 
     #pragma unroll
     for (int mi = 0; mi < 2; mi++) {
@@ -147,21 +140,25 @@ kernel_wgmma(int dim_m, int dim_n, int dim_k,
         for (int ni = 0; ni < 2; ni++) {
             int base_m = block_m + mi * WGMMA_M;
             int base_n = block_n + ni * WGMMA_N;
+
             #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                // Each group of 4 regs covers 2 rows x 2 cols
-                int row = (lane / 4) + (warp * 16) + (i / 2) * 8;
-                int col = (lane % 4) * 2 + (i % 2) * 16;  // rough layout
-                int g_m = base_m + row;
-                int g_n = base_n + col;
-                if (g_m < dim_m && g_n < dim_n)
-                    d_c[g_n * dim_m + g_m] = acc[mi][ni][i * 4];
-                if (g_m < dim_m && g_n + 1 < dim_n)
-                    d_c[(g_n+1) * dim_m + g_m] = acc[mi][ni][i * 4 + 1];
-                if (g_m + 8 < dim_m && g_n < dim_n)
-                    d_c[g_n * dim_m + g_m + 8] = acc[mi][ni][i * 4 + 2];
-                if (g_m + 8 < dim_m && g_n + 1 < dim_n)
-                    d_c[(g_n+1) * dim_m + g_m + 8] = acc[mi][ni][i * 4 + 3];
+            for (int rg = 0; rg < 4; rg++) {   // 4 row groups
+                int row = row_base + (warp % 2) * 8;
+                #pragma unroll
+                for (int cg = 0; cg < 2; cg++) {  // 2 col groups per row group
+                    int col = (lane % 4) * 2 + (rg * 2 + cg) * 8;
+                    int ri  = (rg * 2 + cg) * 4;
+
+                    int g_m0 = base_m + row;
+                    int g_m1 = base_m + row + 8;
+                    int g_n0 = base_n + col;
+                    int g_n1 = base_n + col + 1;
+
+                    if (g_m0 < dim_m && g_n0 < dim_n) d_c[g_n0 * dim_m + g_m0] = acc[mi][ni][ri+0];
+                    if (g_m0 < dim_m && g_n1 < dim_n) d_c[g_n1 * dim_m + g_m0] = acc[mi][ni][ri+1];
+                    if (g_m1 < dim_m && g_n0 < dim_n) d_c[g_n0 * dim_m + g_m1] = acc[mi][ni][ri+2];
+                    if (g_m1 < dim_m && g_n1 < dim_n) d_c[g_n1 * dim_m + g_m1] = acc[mi][ni][ri+3];
+                }
             }
         }
     }
@@ -206,7 +203,6 @@ int main(int argc, const char **argv) {
     dim3 block(BLOCK_THREADS);
     dim3 grid((m+TILE_M-1)/TILE_M, (n+TILE_N-1)/TILE_N);
 
-    // Test run first
     kernel_wgmma<<<grid, block>>>(m, n, k, A, B, C2);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
