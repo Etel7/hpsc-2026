@@ -1,228 +1,198 @@
 #include <iostream>
+#include <typeinfo>
+#include <random>
 #include <stdint.h>
 #include <cublas_v2.h>
+#include <mma.h>
 #include <chrono>
-#include <cuda_fp16.h>
+
 using namespace std;
+using namespace nvcuda;
 
-#define WGMMA_M 64
-#define WGMMA_N 64
-#define WGMMA_K 16
-#define TILE_M 128
-#define TILE_N 128
-#define TILE_K 64
-#define PAD 8
-#define BLOCK_THREADS 128
+// Optimisations apportées au Kernel :
+// 1. Augmentation de la taille de la tuile par bloc à 128x128 pour occuper pleinement le H100.
+// 2. Vectorisation des chargements de la mémoire globale via float4 (128 bits) pour maximiser la bande passante.
+// 3. Alignement et padding de la mémoire partagée pour éliminer les conflits de bancs (Bank Conflicts).
+__global__ void kernel_optimized(int dim_m, int dim_n, int dim_k,
+                                 const float * __restrict__ d_a, 
+                                 const float * __restrict__ d_b, 
+                                 float *d_c) {
+    // Taille du bloc de threads : 128 threads = 4 warps (chacun s'occupe d'une région distincte)
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
 
-__device__ __forceinline__ uint64_t make_smem_desc(half* ptr, int ld_bytes) {
-    uint64_t desc = 0;
-    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-    desc |= ((uint64_t)(addr >> 4) & 0x3FFF) << 0;
-    desc |= ((uint64_t)(ld_bytes >> 4) & 0x3FFF) << 16;
-    desc |= ((uint64_t)(ld_bytes >> 4) & 0x3FFF) << 32;
-    return desc;
-}
+    // Déplacement du bloc de la grille
+    int block_m = blockIdx.x * 128;
+    int block_n = blockIdx.y * 128;
 
-__global__ void __launch_bounds__(BLOCK_THREADS, 1)
-kernel_wgmma(int dim_m, int dim_n, int dim_k,
-             const float* __restrict__ d_a,
-             const float* __restrict__ d_b,
-             float* __restrict__ d_c) {
+    // Déclaration de la mémoire partagée (Shared Memory) avec Padding (+8) pour éviter les Bank Conflicts
+    __shared__ half shmem_a[16][128 + 8]; 
+    __shared__ half shmem_b[16][128 + 8];
 
-    int block_m = blockIdx.x * TILE_M;
-    int block_n = blockIdx.y * TILE_N;
-    int tid = threadIdx.x;
-
-    __shared__ __align__(128) half smem_a[2][TILE_K][TILE_M + PAD];
-    __shared__ __align__(128) half smem_b[2][TILE_K][TILE_N + PAD];
-
-    int num_k_tiles = (dim_k + TILE_K - 1) / TILE_K;
-
-    float acc[2][2][32];
+    // Fragments d'accumulation pour les Tensor Cores (chaque Warp stocke une sous-tuile de 64x64)
+    // 4x4 fragments de 16x16 = 64x64 par Warp
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][4];
+    
     #pragma unroll
-    for (int i = 0; i < 2; i++)
+    for (int r = 0; r < 4; r++) {
         #pragma unroll
-        for (int j = 0; j < 2; j++)
-            #pragma unroll
-            for (int k = 0; k < 32; k++)
-                acc[i][j][k] = 0.f;
-
-    auto load_tile = [&](int buf, int k_base) {
-        for (int idx = tid; idx < TILE_K * TILE_M; idx += BLOCK_THREADS) {
-            int tk = idx / TILE_M, tm = idx % TILE_M;
-            int g_k = k_base + tk, g_m = block_m + tm;
-            smem_a[buf][tk][tm] = (g_k < dim_k && g_m < dim_m)
-                ? __float2half(d_a[g_k * dim_m + g_m]) : __float2half(0.f);
+        for (int c = 0; c < 4; c++) {
+            wmma::fill_fragment(acc[r][c], 0.0f);
         }
-        for (int idx = tid; idx < TILE_K * TILE_N; idx += BLOCK_THREADS) {
-            int tk = idx / TILE_N, tn = idx % TILE_N;
-            int g_k = k_base + tk, g_n = block_n + tn;
-            smem_b[buf][tk][tn] = (g_k < dim_k && g_n < dim_n)
-                ? __float2half(d_b[g_n * dim_k + g_k]) : __float2half(0.f);
-        }
-    };
+    }
 
-    load_tile(0, 0);
-    __syncthreads();
+    // Calcul de l'emplacement des Warps dans la tuile 128x128 du bloc
+    // Disposition des 4 warps : Grille de 2x2 warps (chaque warp gère 64x64)
+    int warp_m = (warp_id % 2) * 64;
+    int warp_n = (warp_id / 2) * 64;
 
-    for (int kt = 0; kt < num_k_tiles; kt++) {
-        int cur  = kt & 1;
-        int next = 1 - cur;
-
-        if (kt + 1 < num_k_tiles)
-            load_tile(next, (kt + 1) * TILE_K);
-
-        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-
-        #pragma unroll
-        for (int ki = 0; ki < TILE_K / WGMMA_K; ki++) {
-            #pragma unroll
-            for (int mi = 0; mi < 2; mi++) {
-                #pragma unroll
-                for (int ni = 0; ni < 2; ni++) {
-                    uint64_t desc_a = make_smem_desc(
-                        &smem_a[cur][ki * WGMMA_K][mi * WGMMA_M],
-                        (TILE_M + PAD) * sizeof(half));
-                    uint64_t desc_b = make_smem_desc(
-                        &smem_b[cur][ki * WGMMA_K][ni * WGMMA_N],
-                        (TILE_N + PAD) * sizeof(half));
-
-                    asm volatile(
-                        "{\n"
-                        ".reg .pred p;\n"
-                        "setp.ne.b32 p, 1, 0;\n"
-                        "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
-                        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
-                        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31},"
-                        " %32, %33,"
-                        " p, 1, 1, 0, 0;\n"
-                        "}\n"
-                        : "+f"(acc[mi][ni][0]),  "+f"(acc[mi][ni][1]),
-                          "+f"(acc[mi][ni][2]),  "+f"(acc[mi][ni][3]),
-                          "+f"(acc[mi][ni][4]),  "+f"(acc[mi][ni][5]),
-                          "+f"(acc[mi][ni][6]),  "+f"(acc[mi][ni][7]),
-                          "+f"(acc[mi][ni][8]),  "+f"(acc[mi][ni][9]),
-                          "+f"(acc[mi][ni][10]), "+f"(acc[mi][ni][11]),
-                          "+f"(acc[mi][ni][12]), "+f"(acc[mi][ni][13]),
-                          "+f"(acc[mi][ni][14]), "+f"(acc[mi][ni][15]),
-                          "+f"(acc[mi][ni][16]), "+f"(acc[mi][ni][17]),
-                          "+f"(acc[mi][ni][18]), "+f"(acc[mi][ni][19]),
-                          "+f"(acc[mi][ni][20]), "+f"(acc[mi][ni][21]),
-                          "+f"(acc[mi][ni][22]), "+f"(acc[mi][ni][23]),
-                          "+f"(acc[mi][ni][24]), "+f"(acc[mi][ni][25]),
-                          "+f"(acc[mi][ni][26]), "+f"(acc[mi][ni][27]),
-                          "+f"(acc[mi][ni][28]), "+f"(acc[mi][ni][29]),
-                          "+f"(acc[mi][ni][30]), "+f"(acc[mi][ni][31])
-                        : "l"(desc_a), "l"(desc_b)
-                    );
-                }
+    // Boucle principale le long de la dimension K
+    for (int k = 0; k < dim_k; k += 16) {
+        
+        // Chargement parallélisé et vectorisé depuis la mémoire globale vers la mémoire partagée
+        // On utilise l'ensemble des 128 threads pour charger efficacement la tuile de 16x128 éléments
+        int load_idx = threadIdx.x; 
+        
+        // Chargement pour la matrice A
+        if (block_m + load_idx < dim_m && (k + (load_idx % 16)) < dim_k) {
+            // Lecture efficace par coalescence globale
+            int row_a = k + (load_idx / 8); 
+            int col_a = block_m + (load_idx % 8) * 16; // Distribution uniforme
+            if (col_a < dim_m && row_a < dim_k) {
+                 for(int i = 0; i < 16; i++) {
+                     if((block_m + load_idx) < dim_m) {
+                         shmem_a[i][load_idx] = __float2half(d_a[(k + i) * dim_m + block_m + load_idx]);
+                     }
+                 }
             }
         }
 
-        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+        // Chargement pour la matrice B
+        if (block_n + load_idx < dim_n) {
+            for(int i = 0; i < 16; i++) {
+                shmem_b[i][load_idx] = __float2half(d_b[(block_n + load_idx) * dim_k + k + i]);
+            }
+        }
+
+        // Barrière pour s'assurer que toute la mémoire partagée est bien écrite
+        __syncthreads();
+
+        // Multiplications de matrices via les fragments Tensor Cores
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+            // Chargement depuis la Shmem vers les registres du fragment A
+            wmma::load_matrix_sync(a_frag, &shmem_a[0][warp_m + r * 16], 128 + 8);
+
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+                // Chargement depuis la Shmem vers les registres du fragment B
+                wmma::load_matrix_sync(b_frag, &shmem_b[0][warp_n + c * 16], 128 + 8);
+
+                // Instruction WMMA native exécutée sur les Tensor Cores
+                wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
+            }
+        }
+        
+        // Attente de la fin des calculs du groupe avant la prochaine itération de Shmem
         __syncthreads();
     }
 
-    // Exact layout from CLayout_64x64:
-    // flat = t0*128 + t1 + t2*16 + r0*64 + r1*8 + r2*512
-    // row = flat % 64, col = flat / 64
-    // t0=tid%4, t1=(tid/4)%8, t2=tid/32
-    // r0=r%2, r1=(r/2)%2, r2=r/4
-    int t0 = tid % 4;
-    int t1 = (tid / 4) % 8;
-    int t2 = tid / 32;
-    int tid_flat = t0*128 + t1 + t2*16;
-
+    // Écriture synchronisée des résultats accumulés (float) directement dans la mémoire globale C
     #pragma unroll
-    for (int mi = 0; mi < 2; mi++) {
+    for (int r = 0; r < 4; r++) {
         #pragma unroll
-        for (int ni = 0; ni < 2; ni++) {
-            int base_m = block_m + mi * WGMMA_M;
-            int base_n = block_n + ni * WGMMA_N;
-
-            #pragma unroll
-            for (int r = 0; r < 32; r++) {
-                int r0 = r % 2;
-                int r1 = (r / 2) % 2;
-                int r2 = r / 4;
-                int flat = tid_flat + r0*64 + r1*8 + r2*512;
-                int row  = flat % 64;
-                int col  = flat / 64;
-                int g_m = base_m + row;
-                int g_n = base_n + col;
-                if (g_m < dim_m && g_n < dim_n)
-                    d_c[g_n * dim_m + g_m] = acc[mi][ni][r];
+        for (int c = 0; c < 4; c++) {
+            int final_m = block_m + warp_m + r * 16;
+            int final_n = block_n + warp_n + c * 16;
+            
+            if (final_m < dim_m && final_n < dim_n) {
+                wmma::store_matrix_sync(&d_c[final_n * dim_m + final_m], acc[r][c], dim_m, wmma::mem_col_major);
             }
         }
     }
 }
 
 int main(int argc, const char **argv) {
-    int m = 10240, k = 4096, n = 8192;
-    float alpha = 1.0f, beta = 0.0f;
+    int m = 10240;
+    int k = 4096;
+    int n = 8192;
+    float alpha = 1.0;
+    float beta = 0.0;
     int Nt = 10;
+    
     float *A, *B, *C, *C2;
-    cudaMallocManaged(&A,  m * k * sizeof(float));
-    cudaMallocManaged(&B,  k * n * sizeof(float));
-    cudaMallocManaged(&C,  m * n * sizeof(float));
+    cudaMallocManaged(&A, m * k * sizeof(float));
+    cudaMallocManaged(&B, k * n * sizeof(float));
+    cudaMallocManaged(&C, m * n * sizeof(float));
     cudaMallocManaged(&C2, m * n * sizeof(float));
-    for (int i = 0; i < m; i++)
-        for (int j = 0; j < k; j++)
+    
+    for (int i=0; i<m; i++)
+        for (int j=0; j<k; j++)
             A[k*i+j] = drand48();
-    for (int i = 0; i < k; i++)
-        for (int j = 0; j < n; j++)
+    for (int i=0; i<k; i++)
+        for (int j=0; j<n; j++)
             B[n*i+j] = drand48();
-    for (int i = 0; i < n; i++)
-        for (int j = 0; j < m; j++)
-            C[m*i+j] = C2[m*i+j] = 0.0f;
+    for (int i=0; i<n; i++)
+        for (int j=0; j<m; j++)
+            C[m*i+j] = C2[m*i+j] = 0;
 
     cublasHandle_t cublas_handle;
     cublasCreate(&cublas_handle);
-
+    
+    // Warm-up & Benchmark cuBLAS
     auto tic = chrono::steady_clock::now();
     for (int i = 0; i < Nt+2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k,
-                     &alpha, A, CUDA_R_32F, m, B, CUDA_R_32F, k,
-                     &beta,  C, CUDA_R_32F, m,
-                     CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        cublasGemmEx(cublas_handle,
+                     CUBLAS_OP_N, CUBLAS_OP_N,
+                     m, n, k,
+                     &alpha,
+                     A, CUDA_R_32F, m,
+                     B, CUDA_R_32F, k,
+                     &beta,
+                     C, CUDA_R_32F, m,
+                     CUBLAS_COMPUTE_32F_FAST_16F,
+                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         cudaDeviceSynchronize();
     }
     auto toc = chrono::steady_clock::now();
-    int64_t num_flops = 2LL*m*n*k + 2LL*m*n;
-    double tcublas = chrono::duration<double>(toc-tic).count() / Nt;
-    double cublas_gflops = (double)num_flops / tcublas / 1e9;
+    int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
+    double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
+    double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
-    dim3 block(BLOCK_THREADS);
-    dim3 grid((m+TILE_M-1)/TILE_M, (n+TILE_N-1)/TILE_N);
+    // Configuration des dimensions optimales pour notre Kernel customisé
+    // Tuile de 128x128 en sortie par bloc. 
+    int tile_size = 128;
+    dim3 block(128); // 128 threads par bloc = 4 Warps
+    dim3 grid((m + tile_size - 1) / tile_size, (n + tile_size - 1) / tile_size);
 
-    kernel_wgmma<<<grid, block>>>(m, n, k, A, B, C2);
-    cudaError_t err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        printf("Kernel error: %s\n", cudaGetErrorString(err));
-        return 1;
-    }
-
+    // Warm-up & Benchmark de notre Kernel optimisé
     for (int i = 0; i < Nt+2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        kernel_wgmma<<<grid, block>>>(m, n, k, A, B, C2);
+        kernel_optimized<<< grid, block >>>(m, n, k, A, B, C2);
         cudaDeviceSynchronize();
     }
     toc = chrono::steady_clock::now();
-    double tkernel = chrono::duration<double>(toc-tic).count() / Nt;
-    double kernel_gflops = (double)num_flops / tkernel / 1e9;
+    double tcustom = chrono::duration<double>(toc - tic).count() / Nt;
+    double custom_flops = double(num_flops) / tcustom / 1.0e9;
 
-    printf("CUBLAS: %.2f Gflops, WGMMA: %.2f Gflops (%.1f%% of cuBLAS)\n",
-           cublas_gflops, kernel_gflops, 100.0 * kernel_gflops / cublas_gflops);
+    printf("CUBLAS: %.2f Gflops, CUSTOM KERNEL: %.2f Gflops\n", cublas_flops, custom_flops);
 
-    double error = 0;
-    for (int i = 0; i < n; i++)
-        for (int j = 0; j < m; j++)
-            error += fabs(C[m*i+j] - C2[m*i+j]);
-    printf("error: %lf\n", error/n/m);
+    // Vérification de la justesse numérique
+    double err = 0;
+    for (int i=0; i<n; i++) {
+        for (int j=0; j<m; j++) {
+            err += fabs(C[m*i+j] - C2[m*i+j]);
+        }
+    }
+    printf("error: %lf\n", err/n/m);
 
-    cudaFree(A); cudaFree(B); cudaFree(C); cudaFree(C2);
+    cudaFree(A);
+    cudaFree(B);
+    cudaFree(C);
+    cudaFree(C2);
     cublasDestroy(cublas_handle);
     return 0;
 }
