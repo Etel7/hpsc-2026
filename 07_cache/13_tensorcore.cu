@@ -1,114 +1,170 @@
 #include <iostream>
-#include <random>
 #include <stdint.h>
 #include <cublas_v2.h>
-#include <mma.h>
 #include <chrono>
+#include <cuda_fp16.h>
 using namespace std;
-using namespace nvcuda;
 
-#define TILE_M 64
-#define TILE_N 64
-#define TILE_K 32
-#define WARPS_M 2
-#define WARPS_N 2
-#define NUM_WARPS 4
-#define BLOCK_THREADS 128
-#define WARP_TILE_M 32   // 64/2
-#define WARP_TILE_N 32   // 64/2
-#define FRAG_M 2         // 32/16
-#define FRAG_N 2         // 32/16
+#define WGMMA_M 64
+#define WGMMA_N 64
+#define WGMMA_K 16
+#define TILE_M 128
+#define TILE_N 128
+#define TILE_K 64
 #define PAD 8
+#define BLOCK_THREADS 128  // 1 warpgroup = 4 warps
 
-__global__ void kernel_opt(int dim_m, int dim_n, int dim_k,
-                           const float * __restrict__ d_a,
-                           const float * __restrict__ d_b,
-                           float * __restrict__ d_c) {
+// Correct smem descriptor for wgmma per PTX ISA 8.x
+__device__ __forceinline__ uint64_t make_smem_desc(half* ptr, int ld_bytes) {
+    uint64_t desc = 0;
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    // bits [13:0]: start address >> 4
+    desc |= ((uint64_t)(addr >> 4) & 0x3FFF) << 0;
+    // bits [29:16]: leading dimension (stride between rows) in units of 16 bytes
+    desc |= ((uint64_t)(ld_bytes >> 4) & 0x3FFF) << 16;
+    // bits [45:32]: stride dimension = same as leading dim for row-major
+    desc |= ((uint64_t)(ld_bytes >> 4) & 0x3FFF) << 32;
+    // bits [61:60]: base offset = 0, layout = 0 (row major)
+    return desc;
+}
+
+__global__ void __launch_bounds__(BLOCK_THREADS, 1)
+kernel_wgmma(int dim_m, int dim_n, int dim_k,
+             const float* __restrict__ d_a,
+             const float* __restrict__ d_b,
+             float* __restrict__ d_c) {
+
     int block_m = blockIdx.x * TILE_M;
     int block_n = blockIdx.y * TILE_N;
-    int warp_id  = threadIdx.x / 32;
-    int warp_row = warp_id / WARPS_N;
-    int warp_col = warp_id % WARPS_N;
-    int warp_m = warp_row * WARP_TILE_M;
-    int warp_n = warp_col * WARP_TILE_N;
+    int tid = threadIdx.x;
 
-    __shared__ half smem_a[2][TILE_K][TILE_M + PAD];
-    __shared__ half smem_b[2][TILE_K][TILE_N + PAD];
-
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[FRAG_M][FRAG_N];
-    #pragma unroll
-    for (int fm = 0; fm < FRAG_M; fm++)
-        #pragma unroll
-        for (int fn = 0; fn < FRAG_N; fn++)
-            wmma::fill_fragment(acc[fm][fn], 0.0f);
+    // Shared memory: double buffered
+    __shared__ __align__(128) half smem_a[2][TILE_K][TILE_M + PAD];
+    __shared__ __align__(128) half smem_b[2][TILE_K][TILE_N + PAD];
 
     int num_k_tiles = (dim_k + TILE_K - 1) / TILE_K;
 
-    {
-        int k_base = 0;
-        for (int idx = threadIdx.x; idx < TILE_K * TILE_M; idx += BLOCK_THREADS) {
+    // Accumulators: wgmma m64n64k16 f32 → 32 floats per warpgroup per call
+    // We do 2x2 wgmma calls (TILE_M/WGMMA_M x TILE_N/WGMMA_N)
+    float acc[2][2][32];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++)
+            #pragma unroll
+            for (int k = 0; k < 32; k++)
+                acc[i][j][k] = 0.f;
+
+    // Load tile lambda
+    auto load_tile = [&](int buf, int k_base) {
+        for (int idx = tid; idx < TILE_K * TILE_M; idx += BLOCK_THREADS) {
             int tk = idx / TILE_M, tm = idx % TILE_M;
             int g_k = k_base + tk, g_m = block_m + tm;
-            smem_a[0][tk][tm] = (g_k < dim_k && g_m < dim_m)
-                                 ? __float2half(d_a[g_k * dim_m + g_m]) : __float2half(0.f);
+            smem_a[buf][tk][tm] = (g_k < dim_k && g_m < dim_m)
+                ? __float2half(d_a[g_k * dim_m + g_m]) : __float2half(0.f);
         }
-        for (int idx = threadIdx.x; idx < TILE_K * TILE_N; idx += BLOCK_THREADS) {
+        for (int idx = tid; idx < TILE_K * TILE_N; idx += BLOCK_THREADS) {
             int tk = idx / TILE_N, tn = idx % TILE_N;
             int g_k = k_base + tk, g_n = block_n + tn;
-            smem_b[0][tk][tn] = (g_k < dim_k && g_n < dim_n)
-                                 ? __float2half(d_b[g_n * dim_k + g_k]) : __float2half(0.f);
+            smem_b[buf][tk][tn] = (g_k < dim_k && g_n < dim_n)
+                ? __float2half(d_b[g_n * dim_k + g_k]) : __float2half(0.f);
         }
-    }
+    };
+
+    load_tile(0, 0);
     __syncthreads();
 
     for (int kt = 0; kt < num_k_tiles; kt++) {
         int cur  = kt & 1;
         int next = 1 - cur;
 
-        if (kt + 1 < num_k_tiles) {
-            int k_base = (kt + 1) * TILE_K;
-            for (int idx = threadIdx.x; idx < TILE_K * TILE_M; idx += BLOCK_THREADS) {
-                int tk = idx / TILE_M, tm = idx % TILE_M;
-                int g_k = k_base + tk, g_m = block_m + tm;
-                smem_a[next][tk][tm] = (g_k < dim_k && g_m < dim_m)
-                                       ? __float2half(d_a[g_k * dim_m + g_m]) : __float2half(0.f);
-            }
-            for (int idx = threadIdx.x; idx < TILE_K * TILE_N; idx += BLOCK_THREADS) {
-                int tk = idx / TILE_N, tn = idx % TILE_N;
-                int g_k = k_base + tk, g_n = block_n + tn;
-                smem_b[next][tk][tn] = (g_k < dim_k && g_n < dim_n)
-                                       ? __float2half(d_b[g_n * dim_k + g_k]) : __float2half(0.f);
+        if (kt + 1 < num_k_tiles)
+            load_tile(next, (kt + 1) * TILE_K);
+
+        // wgmma fence before issuing new MMAs
+        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+
+        #pragma unroll
+        for (int ki = 0; ki < TILE_K / WGMMA_K; ki++) {
+            // 4 wgmma calls: 2 along M x 2 along N
+            #pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                #pragma unroll
+                for (int ni = 0; ni < 2; ni++) {
+                    uint64_t desc_a = make_smem_desc(
+                        &smem_a[cur][ki * WGMMA_K][mi * WGMMA_M],
+                        (TILE_M + PAD) * sizeof(half));
+                    uint64_t desc_b = make_smem_desc(
+                        &smem_b[cur][ki * WGMMA_K][ni * WGMMA_N],
+                        (TILE_N + PAD) * sizeof(half));
+
+                    asm volatile(
+                        "{\n"
+                        ".reg .pred p;\n"
+                        "setp.ne.b32 p, 1, 0;\n"
+                        "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
+                        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+                        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31},"
+                        " %32, %33,"
+                        " p, 1, 1, 0, 0;\n"
+                        "}\n"
+                        : "+f"(acc[mi][ni][0]),  "+f"(acc[mi][ni][1]),
+                          "+f"(acc[mi][ni][2]),  "+f"(acc[mi][ni][3]),
+                          "+f"(acc[mi][ni][4]),  "+f"(acc[mi][ni][5]),
+                          "+f"(acc[mi][ni][6]),  "+f"(acc[mi][ni][7]),
+                          "+f"(acc[mi][ni][8]),  "+f"(acc[mi][ni][9]),
+                          "+f"(acc[mi][ni][10]), "+f"(acc[mi][ni][11]),
+                          "+f"(acc[mi][ni][12]), "+f"(acc[mi][ni][13]),
+                          "+f"(acc[mi][ni][14]), "+f"(acc[mi][ni][15]),
+                          "+f"(acc[mi][ni][16]), "+f"(acc[mi][ni][17]),
+                          "+f"(acc[mi][ni][18]), "+f"(acc[mi][ni][19]),
+                          "+f"(acc[mi][ni][20]), "+f"(acc[mi][ni][21]),
+                          "+f"(acc[mi][ni][22]), "+f"(acc[mi][ni][23]),
+                          "+f"(acc[mi][ni][24]), "+f"(acc[mi][ni][25]),
+                          "+f"(acc[mi][ni][26]), "+f"(acc[mi][ni][27]),
+                          "+f"(acc[mi][ni][28]), "+f"(acc[mi][ni][29]),
+                          "+f"(acc[mi][ni][30]), "+f"(acc[mi][ni][31])
+                        : "l"(desc_a), "l"(desc_b)
+                    );
+                }
             }
         }
 
-        #pragma unroll
-        for (int ki = 0; ki < TILE_K / 16; ki++) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag[FRAG_M];
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag[FRAG_N];
-            #pragma unroll
-            for (int fm = 0; fm < FRAG_M; fm++)
-                wmma::load_matrix_sync(a_frag[fm], &smem_a[cur][ki*16][warp_m + fm*16], TILE_M + PAD);
-            #pragma unroll
-            for (int fn = 0; fn < FRAG_N; fn++)
-                wmma::load_matrix_sync(b_frag[fn], &smem_b[cur][ki*16][warp_n + fn*16], TILE_N + PAD);
-            #pragma unroll
-            for (int fm = 0; fm < FRAG_M; fm++)
-                #pragma unroll
-                for (int fn = 0; fn < FRAG_N; fn++)
-                    wmma::mma_sync(acc[fm][fn], a_frag[fm], b_frag[fn], acc[fm][fn]);
-        }
+        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
         __syncthreads();
     }
 
+    // Store: wgmma m64n64k16 f32 register layout
+    // 128 threads, each owns 32 floats → 4096 output elements per wgmma tile
+    // Layout: thread t → rows {t/4, t/4+8, t/4+16, t/4+24, ...}, cols {(t%4)*2, (t%4)*2+1, +8, +9, ...}
+    int lane = tid % 32;
+    int warp = tid / 32;
+
     #pragma unroll
-    for (int fm = 0; fm < FRAG_M; fm++)
+    for (int mi = 0; mi < 2; mi++) {
         #pragma unroll
-        for (int fn = 0; fn < FRAG_N; fn++) {
-            int g_m = block_m + warp_m + fm * 16;
-            int g_n = block_n + warp_n + fn * 16;
-            if (g_m < dim_m && g_n < dim_n)
-                wmma::store_matrix_sync(&d_c[g_n * dim_m + g_m], acc[fm][fn], dim_m, wmma::mem_col_major);
+        for (int ni = 0; ni < 2; ni++) {
+            int base_m = block_m + mi * WGMMA_M;
+            int base_n = block_n + ni * WGMMA_N;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                // Each group of 4 regs covers 2 rows x 2 cols
+                int row = (lane / 4) + (warp * 16) + (i / 2) * 8;
+                int col = (lane % 4) * 2 + (i % 2) * 16;  // rough layout
+                int g_m = base_m + row;
+                int g_n = base_n + col;
+                if (g_m < dim_m && g_n < dim_n)
+                    d_c[g_n * dim_m + g_m] = acc[mi][ni][i * 4];
+                if (g_m < dim_m && g_n + 1 < dim_n)
+                    d_c[(g_n+1) * dim_m + g_m] = acc[mi][ni][i * 4 + 1];
+                if (g_m + 8 < dim_m && g_n < dim_n)
+                    d_c[g_n * dim_m + g_m + 8] = acc[mi][ni][i * 4 + 2];
+                if (g_m + 8 < dim_m && g_n + 1 < dim_n)
+                    d_c[(g_n+1) * dim_m + g_m + 8] = acc[mi][ni][i * 4 + 3];
+            }
         }
+    }
 }
 
 int main(int argc, const char **argv) {
@@ -149,23 +205,32 @@ int main(int argc, const char **argv) {
 
     dim3 block(BLOCK_THREADS);
     dim3 grid((m+TILE_M-1)/TILE_M, (n+TILE_N-1)/TILE_N);
+
+    // Test run first
+    kernel_wgmma<<<grid, block>>>(m, n, k, A, B, C2);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("Kernel error: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+
     for (int i = 0; i < Nt+2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        kernel_opt<<<grid, block>>>(m, n, k, A, B, C2);
+        kernel_wgmma<<<grid, block>>>(m, n, k, A, B, C2);
         cudaDeviceSynchronize();
     }
     toc = chrono::steady_clock::now();
     double tkernel = chrono::duration<double>(toc-tic).count() / Nt;
     double kernel_gflops = (double)num_flops / tkernel / 1e9;
 
-    printf("CUBLAS: %.2f Gflops, OPT_KERNEL: %.2f Gflops (%.1f%% of cuBLAS)\n",
+    printf("CUBLAS: %.2f Gflops, WGMMA: %.2f Gflops (%.1f%% of cuBLAS)\n",
            cublas_gflops, kernel_gflops, 100.0 * kernel_gflops / cublas_gflops);
 
-    double err = 0;
+    double error = 0;
     for (int i = 0; i < n; i++)
         for (int j = 0; j < m; j++)
-            err += fabs(C[m*i+j] - C2[m*i+j]);
-    printf("error: %lf\n", err/n/m);
+            error += fabs(C[m*i+j] - C2[m*i+j]);
+    printf("error: %lf\n", error/n/m);
 
     cudaFree(A); cudaFree(B); cudaFree(C); cudaFree(C2);
     cublasDestroy(cublas_handle);
