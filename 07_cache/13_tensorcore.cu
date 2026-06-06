@@ -124,13 +124,15 @@ kernel_wgmma(int dim_m, int dim_n, int dim_k,
         __syncthreads();
     }
 
-    // Exact register layout from CLayout_64x64:
-    // flat = t0*128 + t1*1 + t2*16 + r0*64 + r1*8 + r2*512
+    // Exact layout from CLayout_64x64:
+    // flat = t0*128 + t1 + t2*16 + r0*64 + r1*8 + r2*512
     // row = flat % 64, col = flat / 64
-    // where: t0=tid%4, t1=(tid/4)%8, t2=tid/32, r0=r%2, r1=(r/2)%2, r2=r/4
+    // t0=tid%4, t1=(tid/4)%8, t2=tid/32
+    // r0=r%2, r1=(r/2)%2, r2=r/4
     int t0 = tid % 4;
     int t1 = (tid / 4) % 8;
     int t2 = tid / 32;
+    int tid_flat = t0*128 + t1 + t2*16;
 
     #pragma unroll
     for (int mi = 0; mi < 2; mi++) {
@@ -144,14 +146,11 @@ kernel_wgmma(int dim_m, int dim_n, int dim_k,
                 int r0 = r % 2;
                 int r1 = (r / 2) % 2;
                 int r2 = r / 4;
-
-                int flat = t0*128 + t1 + t2*16 + r0*64 + r1*8 + r2*512;
+                int flat = tid_flat + r0*64 + r1*8 + r2*512;
                 int row  = flat % 64;
                 int col  = flat / 64;
-
                 int g_m = base_m + row;
                 int g_n = base_n + col;
-
                 if (g_m < dim_m && g_n < dim_n)
                     d_c[g_n * dim_m + g_m] = acc[mi][ni][r];
             }
