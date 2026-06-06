@@ -124,15 +124,13 @@ kernel_wgmma(int dim_m, int dim_n, int dim_k,
         __syncthreads();
     }
 
-    // Store: wgmma m64n64k16 f32 register layout per PTX ISA
-    // 128 threads, 32 regs each → 4096 floats per 64x64 tile
-    // thread tid owns:
-    //   row = (lane/4) + (warp/2)*16 + (reg_group)*8  (reg_group in 0..3)
-    //   col = (lane%4)*2 + (col_group)*16             (col_group in 0..3, pairs with reg_group)
-    // Each group of 4 consecutive regs: [row, col], [row, col+1], [row+8, col], [row+8, col+1]
-    int lane = tid % 32;
-    int warp = tid / 32;
-    int row_base = (lane / 4) + (warp / 2) * 16;
+    // Exact register layout from CLayout_64x64:
+    // flat = t0*128 + t1*1 + t2*16 + r0*64 + r1*8 + r2*512
+    // row = flat % 64, col = flat / 64
+    // where: t0=tid%4, t1=(tid/4)%8, t2=tid/32, r0=r%2, r1=(r/2)%2, r2=r/4
+    int t0 = tid % 4;
+    int t1 = (tid / 4) % 8;
+    int t2 = tid / 32;
 
     #pragma unroll
     for (int mi = 0; mi < 2; mi++) {
@@ -142,23 +140,20 @@ kernel_wgmma(int dim_m, int dim_n, int dim_k,
             int base_n = block_n + ni * WGMMA_N;
 
             #pragma unroll
-            for (int rg = 0; rg < 4; rg++) {   // 4 row groups
-                int row = row_base + (warp % 2) * 8;
-                #pragma unroll
-                for (int cg = 0; cg < 2; cg++) {  // 2 col groups per row group
-                    int col = (lane % 4) * 2 + (rg * 2 + cg) * 8;
-                    int ri  = (rg * 2 + cg) * 4;
+            for (int r = 0; r < 32; r++) {
+                int r0 = r % 2;
+                int r1 = (r / 2) % 2;
+                int r2 = r / 4;
 
-                    int g_m0 = base_m + row;
-                    int g_m1 = base_m + row + 8;
-                    int g_n0 = base_n + col;
-                    int g_n1 = base_n + col + 1;
+                int flat = t0*128 + t1 + t2*16 + r0*64 + r1*8 + r2*512;
+                int row  = flat % 64;
+                int col  = flat / 64;
 
-                    if (g_m0 < dim_m && g_n0 < dim_n) d_c[g_n0 * dim_m + g_m0] = acc[mi][ni][ri+0];
-                    if (g_m0 < dim_m && g_n1 < dim_n) d_c[g_n1 * dim_m + g_m0] = acc[mi][ni][ri+1];
-                    if (g_m1 < dim_m && g_n0 < dim_n) d_c[g_n0 * dim_m + g_m1] = acc[mi][ni][ri+2];
-                    if (g_m1 < dim_m && g_n1 < dim_n) d_c[g_n1 * dim_m + g_m1] = acc[mi][ni][ri+3];
-                }
+                int g_m = base_m + row;
+                int g_n = base_n + col;
+
+                if (g_m < dim_m && g_n < dim_n)
+                    d_c[g_n * dim_m + g_m] = acc[mi][ni][r];
             }
         }
     }
