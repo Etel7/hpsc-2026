@@ -7,17 +7,17 @@
 using namespace std;
 using namespace nvcuda;
 
-#define TILE_M 128
-#define TILE_N 128
+#define TILE_M 64
+#define TILE_N 64
 #define TILE_K 32
 #define WARPS_M 2
 #define WARPS_N 2
-#define NUM_WARPS (WARPS_M * WARPS_N)
-#define BLOCK_THREADS (NUM_WARPS * 32)
-#define WARP_TILE_M (TILE_M / WARPS_M)
-#define WARP_TILE_N (TILE_N / WARPS_N)
-#define FRAG_M (WARP_TILE_M / 16)
-#define FRAG_N (WARP_TILE_N / 16)
+#define NUM_WARPS 4
+#define BLOCK_THREADS 128
+#define WARP_TILE_M 32   // 64/2
+#define WARP_TILE_N 32   // 64/2
+#define FRAG_M 2         // 32/16
+#define FRAG_N 2         // 32/16
 #define PAD 8
 
 __global__ void kernel_opt(int dim_m, int dim_n, int dim_k,
