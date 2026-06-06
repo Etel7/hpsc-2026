@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <cublas_v2.h>
 #include <mma.h>
-#include <cuda_fp16.h> // <- AJOUT SÉCURITÉ pour half et __float2half
+#include <cuda_fp16.h> 
 #include <chrono>
 #include <cmath>
 
@@ -13,28 +13,28 @@ using namespace nvcuda;
 
 const int TILE_SIZE = 128;
 
-__global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
-                                    const float * __restrict__ d_a, 
-                                    const float * __restrict__ d_b, 
-                                    float *d_c) {
+__global__ void kernel_optimized_v10(int dim_m, int dim_n, int dim_k,
+                                     const float * __restrict__ d_a, 
+                                     const float * __restrict__ d_b, 
+                                     float *d_c) {
     
     int offset_a_m = TILE_SIZE * blockIdx.x;
     int offset_b_n = TILE_SIZE * blockIdx.y;
     
     int warp_id = threadIdx.x / 32;
-    int warp_m = warp_id / 4; 
-    int warp_n = warp_id % 4; 
+    int warp_m = warp_id / 2; // Configuration 2x2 warps au lieu de 2x4
+    int warp_n = warp_id % 2; 
 
-    // Double buffering pour le pipelining
     __shared__ half block_a[2][16][TILE_SIZE + 8];
     __shared__ half block_b[2][16][TILE_SIZE + 8];
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][2];
+    // On passe à 4x4 fragments d'accumulateurs par Warp (Tuile de 64x64)
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][4];
     
     #pragma unroll
     for (int r = 0; r < 4; r++) {
         #pragma unroll
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < 4; c++) {
             wmma::fill_fragment(acc[r][c], 0.0f);
         }
     }
@@ -43,11 +43,11 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
 
     for (int k = 0; k < dim_k + 16; k += 16) {
         
-        // 1. CHARGEMENT ANTICIPÉ
+        // 1. CHARGEMENT ANTICIPÉ (Adapté pour 128 threads -> 4 étapes par thread)
         if (k < dim_k) {
             #pragma unroll
-            for (int step = 0; step < 2; ++step) {
-                int total_f4 = threadIdx.x + step * 256; 
+            for (int step = 0; step < 4; ++step) {
+                int total_f4 = threadIdx.x + step * 128; 
                 int row_k = total_f4 / 32;               
                 int col_m = (total_f4 % 32) * 4;         
                 
@@ -69,8 +69,8 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
             }
 
             #pragma unroll
-            for (int step = 0; step < 2; ++step) {
-                int total_f4 = threadIdx.x + step * 256; 
+            for (int step = 0; step < 4; ++step) {
+                int total_f4 = threadIdx.x + step * 128; 
                 int row_k = (total_f4 % 4) * 4;          
                 int col_n = total_f4 / 4;                
                 
@@ -94,7 +94,7 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
 
         __syncthreads();
 
-        // 2. CALCULS TENSOR CORES
+        // 2. CALCULS TENSOR CORES (Intensité augmentée avec la boucle interne c < 4)
         if (k > 0) {
             int read_stage = 1 - write_stage;
             #pragma unroll
@@ -104,8 +104,8 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
                 wmma::load_matrix_sync(a_frag, &block_a[read_stage][0][row_tile * 16], TILE_SIZE + 8);
 
                 #pragma unroll
-                for (int c = 0; c < 2; c++) {
-                    int col_tile = warp_n * 2 + c;
+                for (int c = 0; c < 4; c++) {
+                    int col_tile = warp_n * 4 + c;
                     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
                     wmma::load_matrix_sync(b_frag, &block_b[read_stage][0][col_tile * 16], TILE_SIZE + 8);
                     
@@ -117,13 +117,13 @@ __global__ void kernel_optimized_v9(int dim_m, int dim_n, int dim_k,
         write_stage = 1 - write_stage;
     }
 
-    // ÉCRITURE
+    // ÉCRITURE FINALE
     #pragma unroll
     for (int r = 0; r < 4; r++) {
         #pragma unroll
-        for (int c = 0; c < 2; c++) {
+        for (int c = 0; c < 4; c++) {
             int c_m = offset_a_m + (warp_m * 4 + r) * 16;
-            int c_n = offset_b_n + (warp_n * 2 + c) * 16;
+            int c_n = offset_b_n + (warp_n * 4 + c) * 16;
             if (c_n < dim_n && c_m < dim_m) {
                 wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
             }
@@ -160,12 +160,13 @@ int main(int argc, const char **argv) {
     double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
     double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
-    dim3 block = dim3(256);
+    // CHANGEMENT CRITIQUE : Blocs de 128 threads au lieu de 256
+    dim3 block = dim3(128);
     dim3 grid = dim3((m + TILE_SIZE - 1) / TILE_SIZE, (n + TILE_SIZE - 1) / TILE_SIZE);
 
     for (int i = 0; i < Nt+2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        kernel_optimized_v9<<< grid, block >>>(m, n, k, A, B, C2);
+        kernel_optimized_v10<<< grid, block >>>(m, n, k, A, B, C2);
         cudaDeviceSynchronize();
     }
     toc = chrono::steady_clock::now();
