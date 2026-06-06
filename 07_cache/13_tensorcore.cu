@@ -14,19 +14,19 @@ const int TILE_M = 128;
 const int TILE_N = 128;
 const int TILE_K = 16;
 
-__global__ void kernel_optimized_v3(int dim_m, int dim_n, int dim_k,
+__global__ void kernel_optimized_v4(int dim_m, int dim_n, int dim_k,
                                     const float * __restrict__ d_a, 
                                     const float * __restrict__ d_b, 
                                     float *d_c) {
     
     int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
 
     int block_m = blockIdx.x * TILE_M;
     int block_n = blockIdx.y * TILE_N;
 
-    // Mémoire partagée avec Padding (+8) pour éliminer les Bank Conflicts
-    __shared__ half shmem_a[TILE_K][TILE_M + 8]; 
+    // Déclaration de la mémoire partagée
+    // shmem_a est indexée en [TILE_M + 8][TILE_K] pour correspondre au chargement col-major originel
+    __shared__ half shmem_a[TILE_M + 8][TILE_K]; 
     __shared__ half shmem_b[TILE_K][TILE_N + 8];
 
     // Fragments d'accumulation (4x4 fragments de 16x16 = tuile de 64x64 par Warp)
@@ -47,67 +47,60 @@ __global__ void kernel_optimized_v3(int dim_m, int dim_n, int dim_k,
     // Itération sur la dimension K
     for (int k = 0; k < dim_k; k += TILE_K) {
         
-        // --- CHARGEMENT SÉCURISÉ ET COALESCÉ DE LA MATRICE A ---
-        // Chaque thread du bloc (128 threads au total) charge des éléments consécutifs
-        // de la matrice A (Column-Major : les éléments consécutifs sont sur la dimension M)
+        // --- CHARGEMENT STRICTEMENT COALESCÉ DE LA MATRICE A (Column-Major) ---
+        // On calque exactement la logique de ton code original, mais parallélisée sur 128 threads
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            int load_idx = threadIdx.x + i * 128; // Permet de couvrir 256 éléments (16 * 128 = 2048 éléments au total)
-            int row_k = load_idx / TILE_M;       // Ligne dans la Shmem (0 à 15)
-            int col_m = load_idx % TILE_M;       // Colonne dans la Shmem (0 à 127)
-            
-            int global_m = block_m + col_m;
-            int global_k = k + row_k;
+        for (int i = 0; i < 16; ++i) {
+            int thread_m = threadIdx.x; // 0 à 127 -> couvre exactement TILE_M
+            int global_m = block_m + thread_m;
+            int global_k = k + i;
             
             if (global_m < dim_m && global_k < dim_k) {
-                shmem_a[row_k][col_m] = __float2half(d_a[global_k * dim_m + global_m]);
+                shmem_a[thread_m][i] = __float2half(d_a[global_k * dim_m + global_m]);
             } else {
-                shmem_a[row_k][col_m] = __float2half(0.0f);
+                shmem_a[thread_m][i] = __float2half(0.0f);
             }
         }
 
-        // --- CHARGEMENT SÉCURISÉ ET COALESCÉ DE LA MATRICE B ---
-        // Matrice B (Row-Major par rapport à notre disposition ou layout d'accès)
+        // --- CHARGEMENT STRICTEMENT COALESCÉ DE LA MATRICE B (Row-Major) ---
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            int load_idx = threadIdx.x + i * 128;
-            int row_k = load_idx / TILE_N;
-            int col_n = load_idx % TILE_N;
-            
-            int global_n = block_n + col_n;
-            int global_k = k + row_k;
+        for (int i = 0; i < 16; ++i) {
+            int thread_n = threadIdx.x; // 0 à 127 -> couvre exactement TILE_N
+            int global_n = block_n + thread_n;
+            int global_k = k + i;
             
             if (global_n < dim_n && global_k < dim_k) {
-                shmem_b[row_k][col_n] = __float2half(d_b[global_n * dim_k + global_k]);
+                shmem_b[i][thread_n] = __float2half(d_b[global_n * dim_k + global_k]);
             } else {
-                shmem_b[row_k][col_n] = __float2half(0.0f);
+                shmem_b[i][thread_n] = __float2half(0.0f);
             }
         }
 
-        // Attente que le transfert de la mémoire globale vers la Shmem soit fini pour le bloc
+        // Synchronisation globale du bloc après remplissage de la Shmem
         __syncthreads();
 
         // --- CALCULS SUR LES TENSOR CORES VIA WMMA ---
         #pragma unroll
         for (int r = 0; r < 4; r++) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-            wmma::load_matrix_sync(a_frag, &shmem_a[0][warp_m + r * 16], TILE_M + 8);
+            // On charge depuis shmem_a qui respecte le format col_major (stride = TILE_K)
+            wmma::load_matrix_sync(a_frag, &shmem_a[warp_m + r * 16][0], TILE_K);
 
             #pragma unroll
             for (int c = 0; c < 4; c++) {
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
                 wmma::load_matrix_sync(b_frag, &shmem_b[0][warp_n + c * 16], TILE_N + 8);
 
-                // Multiplication matérielle synchrone
+                // Multiplication matérielle
                 wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
             }
         }
         
-        // Attente de la fin des calculs avant la prochaine mise à jour de la Shmem
+        // Synchronisation avant l'étape K suivante
         __syncthreads();
     }
 
-    // --- ÉCRITURE FINALE VERS LA MATRICE C DE SORTIE ---
+    // --- ÉCRITURE FINALE VERS LA MATRICE C ---
     #pragma unroll
     for (int r = 0; r < 4; r++) {
         #pragma unroll
@@ -171,14 +164,14 @@ int main(int argc, const char **argv) {
     double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
     double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
-    // Configuration géométrique stable
+    // Configuration géométrique optimale
     dim3 block(128); 
     dim3 grid((m + TILE_M - 1) / TILE_M, (n + TILE_N - 1) / TILE_N);
 
-    // Benchmark du Kernel V3
+    // Benchmark du Kernel V4
     for (int i = 0; i < Nt+2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        kernel_optimized_v3<<< grid, block >>>(m, n, k, A, B, C2);
+        kernel_optimized_v4<<< grid, block >>>(m, n, k, A, B, C2);
         cudaDeviceSynchronize();
     }
     toc = chrono::steady_clock::now();
